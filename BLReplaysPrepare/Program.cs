@@ -94,27 +94,34 @@ public class Program
     public static async Task Main(string[] args)
     {
         int leaderboardCount = 0;
+        int page = 1;
 
-        try
-        {
-            HttpResponseMessage response = await httpClient.GetAsync(apiUrl + "/leaderboards?page=1&count=200&type=ranking&sortBy=timestamp");
-            response.EnsureSuccessStatusCode();
-            string responseBody = await response.Content.ReadAsStringAsync();
-            
-            var leaderboardsPage = JsonSerializer.Deserialize<ResponseWithMetadata<LeaderboardInfo>>(responseBody, jsonOptions);
-
-            foreach (var leaderboard in leaderboardsPage.Data)
+        do {
+            try
             {
-                await DownloadLeaderboardScores(leaderboard.Id);
-                Console.WriteLine($"Leaderboard #{leaderboardCount + 1} of {leaderboardsPage.Metadata.Total}");
-                leaderboardCount++;
-            }
+                HttpResponseMessage response = await httpClient.GetAsync(apiUrl + $"/leaderboards?page={page}&count=500&type=ranking&sortBy=timestamp");
+                response.EnsureSuccessStatusCode();
+                string responseBody = await response.Content.ReadAsStringAsync();
+            
+                var leaderboardsPage = JsonSerializer.Deserialize<ResponseWithMetadata<LeaderboardInfo>>(responseBody, jsonOptions);
+                
+                foreach (var leaderboard in leaderboardsPage.Data)
+                {
+                    await DownloadLeaderboardScores(leaderboard.Id);
+                    Console.WriteLine($"Leaderboard #{leaderboardCount + 1} of {leaderboardsPage.Metadata.Total}");
+                    leaderboardCount++;
+                }
+                if (leaderboardsPage.Data.Count() < 500) {
+                    break;
+                }
+                page++;
 
-        }
-        catch (HttpRequestException e)
-        {
-            Console.WriteLine($"\nException Caught!");
-            Console.WriteLine($"Message :{e.Message}");
-        }
+            }
+            catch (HttpRequestException e)
+            {
+                Console.WriteLine($"\nException Caught!");
+                Console.WriteLine($"Message :{e.Message}");
+            }
+        } while (true);
     }
 }
