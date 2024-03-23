@@ -88,18 +88,20 @@ public class Program
         
         string lbFolder = $"..\\..\\..\\..\\replays\\{id}";
         Directory.CreateDirectory(lbFolder);
-        Task.WaitAll(scores.Scores.OrderByDescending(s => s.BaseScore).Select(s => DownloadReplay(lbFolder, s)).ToArray());
+        await Task.WhenAll(scores.Scores.OrderByDescending(s => s.BaseScore).Select(s => DownloadReplay(lbFolder, s)).ToArray());
     }
 
     public static async Task Main(string[] args)
     {
         int leaderboardCount = 0;
+        int pageSize = 100;
         int page = 1;
+        int pageLimit = 14;
 
         do {
             try
             {
-                HttpResponseMessage response = await httpClient.GetAsync(apiUrl + $"/leaderboards?page={page}&count=500&type=ranking&sortBy=timestamp");
+                HttpResponseMessage response = await httpClient.GetAsync(apiUrl + $"/leaderboards?leaderboardContext=nomods&page={page}&count={pageSize}&type=ranked&sortBy=playcount&order=desc&count=12&allTypes=0&allRequirements=0");
                 response.EnsureSuccessStatusCode();
                 string responseBody = await response.Content.ReadAsStringAsync();
             
@@ -111,7 +113,7 @@ public class Program
                     Console.WriteLine($"Leaderboard #{leaderboardCount + 1} of {leaderboardsPage.Metadata.Total}");
                     leaderboardCount++;
                 }
-                if (leaderboardsPage.Data.Count() < 500) {
+                if (leaderboardsPage.Data.Count() < pageSize || pageLimit == page) {
                     break;
                 }
                 page++;
