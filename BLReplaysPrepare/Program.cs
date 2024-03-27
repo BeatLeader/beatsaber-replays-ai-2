@@ -9,9 +9,14 @@ using System.Net.Http.Headers;
 using NumSharp;
 using BeatLeader_Server.Utils;
 
+public class Difficulty {
+    public float Njs { get; set; }
+}
+
 public class LeaderboardInfo {
     public string Id { get; set; }
     public SongInfo Song { get; set; }
+    public Difficulty? Difficulty { get; set; }
 }
 
 public class SongInfo {
@@ -27,6 +32,9 @@ public class Program
     };
     public static string apiUrl = "https://api.beatleader.xyz";
 
+    public static double clamp(double num, double min, double max) {
+        return Math.Min(Math.Max(num, min), max);
+    }
     public static void SaveNotes(List<NoteEvent> notes, string filename) {
         if (notes.Count == 0) return;
 
@@ -35,7 +43,7 @@ public class Program
         foreach (var note in notes)
         {
             output[index][0] = note.noteID;
-            output[index][1] = note.eventType == NoteEventType.good ? note.noteCutInfo.cutDistanceToCenter : 0.5;
+            output[index][1] = note.eventType == NoteEventType.good ? 1 - clamp(note.noteCutInfo.cutDistanceToCenter / 0.3, 0, 1) : 0.0;
             output[index][2] = note.spawnTime;
             index++;
         }
@@ -43,7 +51,7 @@ public class Program
         np.save(filename, output);
     }
 
-    public static async Task DownloadReplay(string lbFolder, ScoreResponse score) {
+    public static async Task DownloadReplay(string lbFolder, float njs, ScoreResponse score) {
         if (score.Offsets == null || score.Replay?.Length < 1) return;
 
         try {
@@ -70,7 +78,7 @@ public class Program
                     }
                 }
 
-                SaveNotes(notes, lbFolder + $"\\{score.PlayerId}-{score.BaseScore}.npy");    
+                SaveNotes(notes, lbFolder + $"\\{score.PlayerId}-{score.BaseScore}-{njs}.npy");    
             }
 
             
@@ -88,7 +96,7 @@ public class Program
         
         string lbFolder = $"..\\..\\..\\..\\replays\\{id}";
         Directory.CreateDirectory(lbFolder);
-        await Task.WhenAll(scores.Scores.OrderByDescending(s => s.BaseScore).Select(s => DownloadReplay(lbFolder, s)).ToArray());
+        await Task.WhenAll(scores.Scores.OrderByDescending(s => s.BaseScore).Select(s => DownloadReplay(lbFolder, scores.Difficulty.Njs, s)).ToArray());
     }
 
     public static async Task Main(string[] args)
@@ -96,7 +104,7 @@ public class Program
         int leaderboardCount = 0;
         int pageSize = 100;
         int page = 1;
-        int pageLimit = 14;
+        int pageLimit = 22;
 
         do {
             try
