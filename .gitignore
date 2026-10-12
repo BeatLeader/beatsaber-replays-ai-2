@@ -2,3 +2,18 @@ replays
 logs
 maps
 decoded-replays
+/.idea
+/.vs
+/replays acc
+/replays old
+/playlists
+/playlistbackup
+/replays_10-20scores_0.5%diff_SS,BL,AS
+/replays_validation
+cache
+runs
+replays_excluded
+noise_floor.csv
+replays_wide
+replays_test
+/replays - Copy
