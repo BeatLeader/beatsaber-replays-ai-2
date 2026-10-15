@@ -3,7 +3,8 @@ Data loading and preprocessing for the BeatLeader accuracy model.
 
 Pipeline:
     replays/<leaderboard_id>/<playerId>-<accuracy>-<baseScore>-<njs>.npy
-        -> per-map note list (one entry per note, accuracy averaged over players)
+        -> per-map note list (one entry per note, accuracy averaged over players,
+           each player's misses first scaled to a reference player, see PrepConfig.player_skill_file)
         -> per-note feature vectors
         -> fixed-size windows (pre context | predicted notes | post context)
 
@@ -19,7 +20,9 @@ Legacy 3-column files have no eventType, so a stored accuracy of exactly 0 is tr
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import json
 import os
 import pickle
 import re
@@ -75,10 +78,50 @@ class PrepConfig:
     min_good_fraction: float = 0.5   # a note's target is only trusted if this fraction of players cut it well
     aggregate: str = "mean"          # "mean" or "median" over the players' good cuts
     skip_missing_njs: bool = True    # skip maps whose NJS is 0 / missing in the filename
+    # Player-adjusted targets: each replay's misses are scaled to what the reference player would miss, using the
+    # player skills fitted on all ranked scores (tools/player_skill.py). Without it the targets depend on who played the
+    # map (grind maps get the very top players), which is what made some maps overweighted. "" turns it off.
+    player_skill_file: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "player-skill.json")
+    # cap on the scaling of one replay's lost accuracy; wide replay sets (top 50) have players down to ~x0.3
+    skill_factor_limits: tuple = (0.25, 4.0)
+    # Only correct for player pools that are unusual for the kind of map. A map's pool is partly explained by its type:
+    # easy / acc maps and one saber maps are played by more players outside the top, often specialists who do better
+    # there than their overall skill says. Scores can't tell "these players are better here" from "this map is easier",
+    # and correcting the whole type made acc and one saber maps clearly underweighted (portaBLe balance tuner). So the
+    # part of each map's adjustment that its difficulty, speed and mode predict is taken out again (fitted over all maps).
+    center_skill: bool = True
 
     def key(self) -> str:
+        skill = "-s0"
+        if self.player_skill_file:
+            with open(self.player_skill_file, "rb") as f:   # a new skill file rebuilds the cache
+                skill = f"-s{hashlib.md5(f.read()).hexdigest()[:8]}-{self.skill_factor_limits[0]}-{self.skill_factor_limits[1]}"
+            skill += "-v2"   # cache with the fields used by the centering (centering itself is applied after loading)
         return (f"r{self.min_replays}-w{self.full_weight_replays}-p{self.min_note_presence}-g{self.min_good_fraction}"
-                f"-{self.aggregate}-n{int(self.skip_missing_njs)}-f{NOTE_SIZE}")
+                f"-{self.aggregate}-n{int(self.skip_missing_njs)}-f{NOTE_SIZE}{skill}")
+
+
+@functools.lru_cache(maxsize=4)
+def load_player_skills(path: str) -> tuple[float, dict]:
+    """(reference skill, {playerId: skill}) from tools/player_skill.py. Skill = the player's offset in log(1 - accuracy)."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} not found: run tools/player_skill.py (or set PrepConfig.player_skill_file = \"\" "
+                                f"to train on the raw accuracy)")
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    return float(d["Reference"]), d["Skills"]
+
+
+def skill_factor(player_id: str, cfg: PrepConfig) -> float:
+    """How much this player's misses are scaled to match the reference player (1 for players without a skill)."""
+    if not cfg.player_skill_file:
+        return 1.0
+    reference, skills = load_player_skills(cfg.player_skill_file)
+    skill = skills.get(player_id)
+    if skill is None:
+        return 1.0
+    lo, hi = cfg.skill_factor_limits
+    return float(np.clip(np.exp(reference - skill), lo, hi))
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +208,12 @@ class MapData:
     weights: np.ndarray                  # (n_notes,) 1 if the target is trusted, else 0
     good_fraction: np.ndarray            # (n_notes,) fraction of players who cut the note well
     features: np.ndarray = field(default=None)   # (n_notes, NOTE_SIZE)
+    skill_factor: float = 1.0            # mean scaling of the replays' lost accuracy (player-adjusted targets)
+    skill_coverage: float = 1.0          # fraction of the replays whose player has a fitted skill
+    skill_log_shift: float = 0.0         # mean log scaling of the replays' lost accuracy (before centering)
+    skill_centering: float = 0.0         # log scaling taken out again by the centering (see PrepConfig.center_skill)
+    replay_log_loss: float = 0.0         # mean log(1 - accuracy) of the replays, from the filenames (map difficulty)
+    notes_per_second: float = 0.0
 
 
 def list_leaderboards(replays_dir: str) -> list[str]:
@@ -198,6 +247,7 @@ def load_map(folder: str, cfg: PrepConfig, files: list[str] | None = None) -> tu
     # key (noteID, spawnTime) -> list of (accuracy, is_good)
     notes: dict[tuple[int, float], list[tuple[float, bool]]] = {}
     n_loaded = 0
+    factors = []
     for info in infos:
         try:
             arr = np.load(info.path)
@@ -207,6 +257,9 @@ def load_map(folder: str, cfg: PrepConfig, files: list[str] | None = None) -> tu
         if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 3:
             continue
         n_loaded += 1
+        factor = skill_factor(info.player_id, cfg)
+        known = not cfg.player_skill_file or info.player_id in load_player_skills(cfg.player_skill_file)[1]
+        factors.append((factor, known))
         has_event = arr.shape[1] >= 4
         for row in arr:
             note_id = int(row[0])
@@ -218,6 +271,9 @@ def load_map(folder: str, cfg: PrepConfig, files: list[str] | None = None) -> tu
                 good = event == 0
             else:
                 good = acc > 0.0
+            if good and factor != 1.0:
+                # lost accuracy scaled to the reference player: a better player's cut counts as a slightly worse one
+                acc = min(1.0, max(0.0, 1.0 - (1.0 - acc) * factor))
             key = (note_id, round(float(row[2]), 4))
             notes.setdefault(key, []).append((acc, good))
 
@@ -265,7 +321,13 @@ def load_map(folder: str, cfg: PrepConfig, files: list[str] | None = None) -> tu
         targets=rows[:, 2].astype(np.float32),
         weights=rows[:, 3].astype(np.float32),
         good_fraction=rows[:, 4].astype(np.float32),
+        skill_factor=float(np.mean([f for f, _ in factors])),
+        skill_coverage=float(np.mean([k for _, k in factors])),
+        skill_log_shift=float(np.mean([np.log(f) for f, _ in factors])),
+        replay_log_loss=float(np.mean([np.log(1 - min(i.accuracy, 0.9999)) for i in infos])),
     )
+    span = float(m.times[-1] - m.times[0]) if len(m.times) > 1 else 0.0
+    m.notes_per_second = len(m.times) / max(span, 1.0)
     if m.weights.sum() == 0:
         return None, "no trusted notes"
     m.features = build_features(m.note_ids, m.times, m.njs)
@@ -382,6 +444,8 @@ def load_dataset(replays_dir: str, cfg: PrepConfig | None = None, cache_dir: str
         if cached.get("signature") == signature:
             if verbose:
                 print(f"Loaded {len(cached['maps'])} maps from cache {cache_file}")
+            # the cache holds the targets before centering, which is redone on every load (cheap)
+            center_player_skill(cached["maps"], cfg, verbose)
             return cached["maps"]
 
     maps: dict[str, MapData] = {}
@@ -411,7 +475,60 @@ def load_dataset(replays_dir: str, cfg: PrepConfig | None = None, cache_dir: str
 
     with open(cache_file, "wb") as f:
         pickle.dump({"signature": signature, "maps": maps}, f)
+    center_player_skill(maps, cfg, verbose)
     return maps
+
+
+SKILL_CENTERING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill-centering.json")
+MIN_MAPS_TO_FIT_CENTERING = 500
+
+
+def _centering_features(m: MapData) -> np.ndarray:
+    x = m.replay_log_loss
+    s = np.log(max(m.notes_per_second, 0.1))
+    one_saber = 1.0 if m.leaderboard_id.endswith("2") else 0.0     # BeatLeader ids end with the mode: 2 = OneSaber
+    return np.array([1.0, x, x * x, one_saber, s, s * s, s * x])
+
+
+def center_player_skill(maps: dict[str, MapData], cfg: PrepConfig, verbose: bool = True):
+    """Takes out the part of each map's player adjustment that its kind of map predicts (PrepConfig.center_skill).
+
+    Fits mean log scaling ~ difficulty (replay accuracy), speed (notes per second) and one saber over the maps, then
+    rescales each map's targets by exp(-(predicted - average)): only pools that are unusual for that kind of map stay
+    corrected, and the average adjustment (the reference player's level) is kept.
+    Big datasets fit the coefficients and save them to skill-centering.json; small ones (replays_validation) reuse them.
+    """
+    if not cfg.player_skill_file or not cfg.center_skill or not maps:
+        return
+    ms = list(maps.values())
+    X = np.stack([_centering_features(m) for m in ms])
+    yv = np.array([m.skill_log_shift for m in ms])
+    with open(cfg.player_skill_file, "rb") as f:
+        skill_hash = hashlib.md5(f.read()).hexdigest()[:8]
+    if len(ms) >= MIN_MAPS_TO_FIT_CENTERING:
+        beta = np.linalg.lstsq(X, yv, rcond=None)[0]
+        level = float(yv.mean())
+        with open(SKILL_CENTERING_FILE, "w", encoding="utf-8") as f:
+            json.dump({"SkillFile": skill_hash, "Maps": len(ms), "Coefficients": beta.tolist(), "Level": level}, f)
+    else:
+        if not os.path.exists(SKILL_CENTERING_FILE):
+            raise FileNotFoundError(f"{SKILL_CENTERING_FILE} not found: load the training replays first, it is fitted there")
+        with open(SKILL_CENTERING_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("SkillFile") != skill_hash:
+            print(f"  warning: {SKILL_CENTERING_FILE} was fitted with another player-skill.json")
+        beta = np.array(saved["Coefficients"])
+        if "Level" not in saved:
+            raise ValueError(f"{SKILL_CENTERING_FILE} is from an older version: load the training replays again to refit it")
+        level = float(saved["Level"])
+    predicted = X @ beta - level     # only the part that differs from the average adjustment
+    for m, p in zip(ms, predicted):
+        m.skill_centering = float(p)
+        m.targets = np.clip(1.0 - (1.0 - m.targets) * np.exp(-p), 0.0, 1.0).astype(np.float32)
+    if verbose:
+        left = yv - predicted
+        print(f"  player adjustment: mean log scaling {yv.mean():+.3f} (sd {yv.std():.3f}); "
+              f"after centering on the kind of map {left.mean():+.3f} (sd {left.std():.3f}), level kept at {level:+.3f}")
 
 
 def split_by_song(leaderboard_ids, val_fraction=0.15, test_fraction=0.15, exclude_songs=(), seed="6969"):

@@ -6,8 +6,8 @@ training does. If the two halves disagree, that disagreement is noise in the dat
 Scaled to the full player group, it gives the error a perfect model would still have against the real data
 ("noise floor"), to compare with the model's test error.
 
-    python noise_floor.py                                         # all maps in replays/
-    python noise_floor.py --maps-from runs/<timestamp>/predictions_test.csv   # same maps as a run's test set
+    python tools/noise_floor.py                                         # all maps in replays/
+    python tools/noise_floor.py --maps-from runs/<timestamp>/predictions_test.csv   # same maps as a run's test set
 """
 
 from __future__ import annotations
@@ -19,8 +19,11 @@ import os
 import random
 from concurrent.futures import ProcessPoolExecutor
 
+import sys
+
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # data.py, evaluation.py
 import data
 import evaluation
 
@@ -83,7 +86,7 @@ def split_map(args):
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (this script is in tools/)
     p = argparse.ArgumentParser()
     p.add_argument("--replays", default=os.path.join(here, "replays"))
     p.add_argument("--maps-from", help="only the leaderboards in a predictions CSV (e.g. a run's predictions_test.csv)")

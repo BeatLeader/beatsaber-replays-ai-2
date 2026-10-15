@@ -1,19 +1,29 @@
-replays
-logs
-maps
-decoded-replays
+# IDE / environment
 /.idea
 /.vs
-/replays acc
-/replays old
-/playlists
-/playlistbackup
-/replays_10-20scores_0.5%diff_SS,BL,AS
-/replays_validation
-cache
-runs
-replays_excluded
-noise_floor.csv
-replays_wide
-replays_test
-/replays - Copy
+/.venv
+__pycache__/
+.ipynb_checkpoints/
+bin/
+obj/
+
+# Replays and other downloaded / generated data (see README)
+/replays*/
+/replays*
+/parity/
+/parity2/
+/heads/
+/decoded-replays/
+/maps/
+/logs/
+/cache/
+/runs/
+/playlists/
+/playlistbackup/
+/_archive/
+
+# Generated from portaBLe's score export (tools/player_skill.py) and by training
+/player-skill.json
+/skill-centering.json
+/noise_floor.csv
+/model_sleep_bl_replays*.csv

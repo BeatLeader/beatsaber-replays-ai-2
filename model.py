@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
-import tensorflow as tf
 import keras  # Keras 3 directly; `from tensorflow import keras` can load the legacy tf_keras shim
-from keras import layers
+from keras import layers, ops   # keras.ops: same code on the TensorFlow and PyTorch backends (train.py --backend)
 
 import data
 
@@ -23,16 +22,16 @@ def masked_mse(y_true, y_pred):
     target = y_true[..., 0]
     weight = y_true[..., 1]
     pred = y_pred[..., 0]
-    used = tf.cast(weight > 0, weight.dtype)
-    return tf.reduce_sum(weight * tf.square(target - pred), axis=-1) / tf.maximum(tf.reduce_sum(used, axis=-1), 1.0)
+    used = ops.cast(weight > 0, "float32")
+    return ops.sum(weight * ops.square(target - pred), axis=-1) / ops.maximum(ops.sum(used, axis=-1), 1.0)
 
 
 @keras.saving.register_keras_serializable(package="accai")
 def masked_mae(y_true, y_pred):
     target = y_true[..., 0]
-    used = tf.cast(y_true[..., 1] > 0, y_true.dtype)  # plain average error, not weighted
+    used = ops.cast(y_true[..., 1] > 0, "float32")  # plain average error, not weighted
     pred = y_pred[..., 0]
-    return tf.reduce_sum(used * tf.abs(target - pred), axis=-1) / tf.maximum(tf.reduce_sum(used, axis=-1), 1.0)
+    return ops.sum(used * ops.abs(target - pred), axis=-1) / ops.maximum(ops.sum(used, axis=-1), 1.0)
 
 
 def build_model(note_size: int = data.NOTE_SIZE, lstm_units=(12, 10), dense_units: int = 16) -> keras.Model:

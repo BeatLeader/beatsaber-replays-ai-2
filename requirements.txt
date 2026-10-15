@@ -1,7 +1,9 @@
 # Environment used for training (Python 3.12, the repo's .venv):
 #   py -3.12 -m venv .venv
 #   .venv\Scripts\python.exe -m pip install -r requirements.txt
-# Native Windows TensorFlow runs on CPU only, which is fine for this model size.
+# Native Windows TensorFlow runs on CPU only. To train on an NVIDIA GPU, also install PyTorch with CUDA and use
+# `train.py --backend torch` (RTX 50 series needs the CUDA 12.8+ build):
+#   .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 # The pins keep pip from upgrading packages TensorFlow 2.18 can't use (protobuf, ml_dtypes);
 # onnx is pinned because newer versions require ml_dtypes 0.5+.
 tensorflow==2.18.*

@@ -2,9 +2,9 @@
 Find leaderboards in replays/ that use Noodle Extensions or Mapping Extensions (or other map requirements)
 and move them out of the training data.
 
-    python remove_modded_maps.py              # list them only
-    python remove_modded_maps.py --move       # move them to replays_excluded/
-    python remove_modded_maps.py --requirements 396 --move   # also VNJS (128) and Vivify (256)
+    python tools/remove_modded_maps.py              # list them only
+    python tools/remove_modded_maps.py --move       # move them to replays_excluded/
+    python tools/remove_modded_maps.py --requirements 396 --move   # also VNJS (128) and Vivify (256)
 
 Asks BeatLeader for every leaderboard with those requirements (mapRequirements=<flags>&allRequirements=0, "any"),
 most played first, down to --min-plays. Only folder names are compared; nothing is deleted.
@@ -52,7 +52,7 @@ def fetch_ids(requirements: int, min_plays: int) -> set[str]:
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (this script is in tools/)
     p = argparse.ArgumentParser()
     p.add_argument("--replays", default=os.path.join(here, "replays"))
     p.add_argument("--requirements", type=int, default=12, help="BeatLeader requirement flags (12 = Noodle + Mapping Extensions)")

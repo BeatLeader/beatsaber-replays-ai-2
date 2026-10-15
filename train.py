@@ -4,6 +4,13 @@ Train the accuracy model.
     python train.py                          # train on replays/, evaluate, export ONNX
     python train.py --rebuild                # ignore the preprocessing cache
     python train.py --epochs 200 --batch-size 512
+    python train.py --no-player-skill        # raw replay accuracy as targets (no player adjustment)
+    python train.py --backend torch          # train on the GPU through PyTorch (native Windows TensorFlow is CPU only);
+                                             # the ONNX export still goes through TensorFlow, in a separate process
+    python train.py --init runs/<run>/best.keras --lr 5e-4
+                                             # start from an earlier model (same --lstm-units / --dense-units) instead of
+                                             # random weights: when only the targets changed a little, it converges in a
+                                             # fraction of the epochs. Train the final model from scratch.
 
 Outputs go to runs/<timestamp>/:
     best.keras            best weights by validation loss
@@ -33,6 +40,8 @@ import argparse
 import datetime
 import json
 import os
+import subprocess
+import sys
 
 import numpy as np
 
@@ -58,6 +67,12 @@ def parse_args():
     p.add_argument("--workers", type=int, default=None, help="processes for preprocessing (default: all cores)")
     p.add_argument("--rebuild", action="store_true", help="rebuild the preprocessing cache")
     p.add_argument("--seed", type=int, default=6969)
+    p.add_argument("--backend", choices=["tensorflow", "torch"], default=os.environ.get("KERAS_BACKEND", "tensorflow"),
+                   help="Keras backend; torch trains on an NVIDIA GPU on native Windows (pip install torch, CUDA build)")
+    p.add_argument("--init", metavar="KERAS_FILE",
+                   help="start from the weights of an earlier run's best.keras (same model size) instead of random weights")
+    p.add_argument("--no-player-skill", action="store_true",
+                   help="train on the raw replay accuracy instead of the player-adjusted targets (data.PrepConfig)")
     p.add_argument("--no-onnx", action="store_true")
     p.add_argument("--final", action="store_true",
                    help="also train on the test maps and replays_validation; only val is scored")
@@ -89,7 +104,16 @@ def lr_schedule(history_csv: str, base_lr: float, epochs: int, drops: str) -> li
     return lrs[:epochs]
 
 
-def export_onnx(model, path):
+def export_onnx(model, path, keras_path=None):
+    import keras
+    if keras.backend.backend() != "tensorflow":
+        # tf2onnx needs a TensorFlow model: reload the saved .keras (backend independent) with TensorFlow in a new process
+        env = dict(os.environ, KERAS_BACKEND="tensorflow")
+        result = subprocess.run([sys.executable, os.path.abspath(__file__), "--export-onnx", keras_path, path], env=env)
+        if result.returncode != 0:
+            print(f"ONNX export failed; the model is in {keras_path}. Export it later with: "
+                  f"python train.py --export-onnx {keras_path} {path}")
+        return
     import tensorflow as tf
     import data
     spec = (tf.TensorSpec((None, data.SEGMENT_SIZE, data.NOTE_SIZE), tf.float32, name="input_1"),)
@@ -102,11 +126,18 @@ def export_onnx(model, path):
     print(f"ONNX model saved to {path}")
 
 
+def export_onnx_from_file(keras_path, onnx_path):
+    import keras
+    import model as _model  # registers the custom loss / metric
+    export_onnx(keras.models.load_model(keras_path, compile=False), onnx_path)
+
+
 def main():
     args = parse_args()
+    # The backend has to be chosen before Keras is imported.
+    os.environ["KERAS_BACKEND"] = args.backend
 
     # Imports after argparse so `python train.py -h` is instant.
-    import tensorflow as tf
     import keras
 
     import data
@@ -114,14 +145,20 @@ def main():
     from model import build_model, compile_model, keras_predictor
 
     keras.utils.set_random_seed(args.seed)
-    print(f"TensorFlow {tf.__version__}, Keras {keras.__version__}, GPUs: {tf.config.list_physical_devices('GPU')}")
+    if args.backend == "torch":
+        import torch
+        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none (CPU)"
+        print(f"PyTorch {torch.__version__}, Keras {keras.__version__}, GPU: {gpu}")
+    else:
+        import tensorflow as tf
+        print(f"TensorFlow {tf.__version__}, Keras {keras.__version__}, GPUs: {tf.config.list_physical_devices('GPU')}")
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join("runs", stamp)
     os.makedirs(run_dir, exist_ok=True)
 
     # ---- data -------------------------------------------------------------
-    cfg = data.PrepConfig()
+    cfg = data.PrepConfig(player_skill_file="") if args.no_player_skill else data.PrepConfig()
     maps = data.load_dataset(args.replays, cfg, workers=args.workers, rebuild=args.rebuild)
 
     handpicked = {}
@@ -160,6 +197,13 @@ def main():
     # ---- model ------------------------------------------------------------
     lstm_units = tuple(int(u) for u in args.lstm_units.split(","))
     model = compile_model(build_model(data.NOTE_SIZE, lstm_units, args.dense_units), args.lr)
+    if args.init:
+        start = keras.models.load_model(args.init, compile=False)
+        try:
+            model.set_weights(start.get_weights())
+        except ValueError as e:
+            raise SystemExit(f"{args.init} doesn't match this model (check --lstm-units / --dense-units): {e}")
+        print(f"Starting from the weights of {args.init}")
     model.summary()
 
     best_path = os.path.join(run_dir, "best.keras")
@@ -191,9 +235,10 @@ def main():
         ]
     callbacks += [
         keras.callbacks.CSVLogger(os.path.join(run_dir, "history.csv")),
-        keras.callbacks.TensorBoard(log_dir=os.path.join("logs", "fit", stamp)),
         keras.callbacks.TerminateOnNaN(),
     ]
+    if args.backend == "tensorflow":   # the TensorBoard callback writes through TensorFlow
+        callbacks.append(keras.callbacks.TensorBoard(log_dir=os.path.join("logs", "fit", stamp)))
 
     model.fit(
         train_x, train_y,
@@ -209,7 +254,7 @@ def main():
 
     # ---- evaluation ---------------------------------------------------------
     predict = keras_predictor(model)
-    summary = {"run": stamp, "final": args.final, "all_data_from": args.all_data, "epochs": args.epochs,"lstm_units": args.lstm_units, "dense_units": args.dense_units, "train_maps": len(train_ids), "note_size": data.NOTE_SIZE, "prep": cfg.key()}
+    summary = {"run": stamp, "final": args.final, "all_data_from": args.all_data, "init": args.init, "epochs": args.epochs,"lstm_units": args.lstm_units, "dense_units": args.dense_units, "train_maps": len(train_ids), "note_size": data.NOTE_SIZE, "prep": cfg.key()}
     for name, source, ids in [("val", maps, val_ids), ("test", maps, test_ids),
                               ("handpicked", handpicked, sorted(handpicked))]:
         if not ids:
@@ -227,9 +272,12 @@ def main():
         json.dump(summary, f, indent=2)
 
     if not args.no_onnx:
-        export_onnx(model, os.path.join(run_dir, "model_sleep_bl.onnx"))
+        export_onnx(model, os.path.join(run_dir, "model_sleep_bl.onnx"), best_path)
     print(f"Done. Results in {run_dir}")
 
 
 if __name__ == "__main__":  # required on Windows because preprocessing uses multiple processes
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--export-onnx":   # used by export_onnx with the torch backend
+        export_onnx_from_file(sys.argv[2], sys.argv[3])
+    else:
+        main()

@@ -36,7 +36,7 @@ public class FilePlaylist {
     public List<PlaylistSong> Songs { get; set; }
 }
 
-public class Program
+public partial class Program
 {
     // One shared client with enough connections for parallel replay downloads.
     private static readonly HttpClient httpClient = new HttpClient(new SocketsHttpHandler {
@@ -315,12 +315,18 @@ public class Program
         // Leaderboards using any of these map requirements are left out (BeatLeader flags: Noodle Extensions 4,
         // Mapping Extensions 8, VNJS 128, Vivify 256, ...). 12 = Noodle + Mapping Extensions. 0 = no filter.
         public int ExcludeRequirements = 396;
+        // Folder of .bplist playlists: only their leaderboards are checked instead of every leaderboard (--playlists)
+        public string? PlaylistsFolder = null;
     }
 
     // Scans the nomods leaderboards (most played first), keeps the valid ones and downloads their replays.
     // Several leaderboards are processed at once; completed ids are stored in a progress file so the run can be resumed.
     public static async Task DownloadAllValidLeaderboards(string replaysRoot, RunOptions opt) {
         Directory.CreateDirectory(replaysRoot);
+        if (opt.PlaylistsFolder != null) {
+            await DownloadPlaylistLeaderboards(replaysRoot, opt);
+            return;
+        }
         string progressFile = Path.Combine(replaysRoot, "completed.txt");
         var done = File.Exists(progressFile) ? new HashSet<string>(File.ReadAllLines(progressFile)) : new HashSet<string>();
         if (opt.RecheckSkipped)
@@ -331,6 +337,7 @@ public class Program
             Console.WriteLine($"Re-checking skipped leaderboards; {done.Count} saved leaderboards are kept as they are.");
         }
 
+        var excluded = ExcludedLeaderboards(replaysRoot);
         var leaderboardSlots = new SemaphoreSlim(opt.ParallelLeaderboards, opt.ParallelLeaderboards);
         var running = new List<Task>();
         int processed = 0, found = 0;
@@ -352,7 +359,7 @@ public class Program
             }
 
             foreach (var lb in data) {
-                if (lb.Plays < opt.MinPlays || done.Contains(lb.Id)) continue;
+                if (lb.Plays < opt.MinPlays || done.Contains(lb.Id) || excluded.Contains(lb.Id)) continue;
                 if (lb.Difficulty != null && lb.Difficulty.Notes < opt.MinNotes) continue;
 
                 await leaderboardSlots.WaitAsync();
@@ -385,6 +392,134 @@ public class Program
         await Task.WhenAll(running);
         Console.WriteLine($"Finished: {processed} leaderboards checked, {found} saved.");
     }
+
+    // Same as DownloadAllValidLeaderboards, but only for the leaderboards of the playlists in opt.PlaylistsFolder
+    // (e.g. the ranked AccSaber / ScoreSaber / BeatLeader maps). Same filters (--min-plays, --min-notes, --top, ...),
+    // same progress file, so a stopped run can be resumed. The playlist -> leaderboard id lookups are saved in
+    // playlist-leaderboards.txt in the output folder, so they are only done once.
+    static async Task DownloadPlaylistLeaderboards(string replaysRoot, RunOptions opt) {
+        var leaderboards = await ResolvePlaylistLeaderboards(opt.PlaylistsFolder!, Path.Combine(replaysRoot, "playlist-leaderboards.txt"), opt.ExcludeRequirements);
+
+        string progressFile = Path.Combine(replaysRoot, "completed.txt");
+        var done = File.Exists(progressFile) ? new HashSet<string>(File.ReadAllLines(progressFile)) : new HashSet<string>();
+        if (opt.RecheckSkipped)
+            done = new HashSet<string>(Directory.EnumerateDirectories(replaysRoot).Select(d => Path.GetFileName(d)));
+        var excluded = ExcludedLeaderboards(replaysRoot);
+
+        var todo = leaderboards
+            .Where(l => l.Plays >= opt.MinPlays && l.Notes >= opt.MinNotes && !done.Contains(l.Id) && !excluded.Contains(l.Id))
+            .OrderByDescending(l => l.Plays)
+            .ToList();
+        Console.WriteLine($"Playlists: {leaderboards.Count} leaderboards, {todo.Count} to check " +
+                          $"({leaderboards.Count(l => l.Plays < opt.MinPlays || l.Notes < opt.MinNotes)} under --min-plays / --min-notes, " +
+                          $"{leaderboards.Count(l => done.Contains(l.Id))} already done, {leaderboards.Count(l => excluded.Contains(l.Id))} in excluded.txt)");
+
+        var leaderboardSlots = new SemaphoreSlim(opt.ParallelLeaderboards, opt.ParallelLeaderboards);
+        var running = new List<Task>();
+        int processed = 0, found = 0;
+        var started = DateTime.UtcNow;
+        foreach (var lb in todo) {
+            await leaderboardSlots.WaitAsync();
+            running.Add(Task.Run(async () => {
+                try {
+                    bool saved = await ProcessLeaderboard(lb.Id, lb.Njs, lb.Label, replaysRoot, opt);
+                    lock (progressLock) {
+                        File.AppendAllLines(progressFile, new[] { lb.Id });
+                        processed++;
+                        if (saved) found++;
+                        if (processed % 25 == 0) {
+                            var rate = processed / Math.Max(1, (DateTime.UtcNow - started).TotalMinutes);
+                            Console.WriteLine($"--- {processed}/{todo.Count} leaderboards checked, {found} saved, {rate:F1}/min ---");
+                        }
+                    }
+                } catch (Exception e) {
+                    Console.WriteLine($"Leaderboard {lb.Label} failed: {e.Message}");
+                } finally {
+                    leaderboardSlots.Release();
+                }
+            }));
+            running.RemoveAll(t => t.IsCompleted);
+        }
+        await Task.WhenAll(running);
+        Console.WriteLine($"Finished: {processed} leaderboards checked, {found} saved.");
+    }
+
+    // Leaderboard ids never to download, one per line ("id  # comment"), in excluded.txt in the output folder.
+    // For maps the requirements filter misses (e.g. VNJS maps whose requirement flag isn't set).
+    static HashSet<string> ExcludedLeaderboards(string replaysRoot) {
+        string file = Path.Combine(replaysRoot, "excluded.txt");
+        if (!File.Exists(file)) return new HashSet<string>();
+        return File.ReadAllLines(file)
+            .Select(l => (l.Contains('#') ? l[..l.IndexOf('#')] : l).Trim())
+            .Where(l => l.Length > 0)
+            .ToHashSet();
+    }
+
+    record PlaylistLeaderboard(string Id, int Plays, int Notes, float Njs, string Label);
+
+    // Lookups exclude the maps using any of the excludeRequirements flags (Noodle, Mapping Extensions, VNJS, Vivify, ...),
+    // like the full scan. Lookups saved before that filter existed are kept as they are (use excluded.txt for those).
+    static async Task<List<PlaylistLeaderboard>> ResolvePlaylistLeaderboards(string folder, string cacheFile, int excludeRequirements) {
+        // (hash, characteristic, difficulty) of every playlist entry, without duplicates (maps are in several playlists,
+        // and ScoreSaber playlists write the hash in upper case)
+        var entries = new HashSet<(string Hash, string Characteristic, string Name)>();
+        foreach (var file in Directory.EnumerateFiles(folder, "*.bplist").Concat(Directory.EnumerateFiles(folder, "*.json")).OrderBy(f => f)) {
+            var playlist = JsonSerializer.Deserialize<FilePlaylist>(File.ReadAllText(file), jsonOptions);
+            int before = entries.Count;
+            foreach (var song in playlist?.Songs ?? new())
+                foreach (var diff in song.Difficulties ?? new())
+                    if (!string.IsNullOrWhiteSpace(song.Hash) && !string.IsNullOrWhiteSpace(diff.Name))
+                        entries.Add((song.Hash.ToLowerInvariant(), diff.Characteristic ?? "Standard", diff.Name));
+            Console.WriteLine($"  {Path.GetFileName(file)}: {entries.Count - before} new difficulties");
+        }
+
+        // Lookups already done: "hash<TAB>characteristic<TAB>difficulty<TAB>id<TAB>plays<TAB>notes<TAB>njs<TAB>label" (id "-" = not found)
+        var cache = new Dictionary<(string, string, string), PlaylistLeaderboard?>();
+        if (File.Exists(cacheFile)) {
+            foreach (var line in File.ReadAllLines(cacheFile)) {
+                var p = line.Split('\t');
+                if (p.Length < 4) continue;
+                cache[(p[0], p[1], p[2])] = p[3] == "-" || p.Length < 8 ? null
+                    : new PlaylistLeaderboard(p[3], int.Parse(p[4]), int.Parse(p[5]), float.Parse(p[6], System.Globalization.CultureInfo.InvariantCulture), p[7]);
+            }
+        }
+        var missing = entries.Where(e => !cache.ContainsKey(e)).ToList();
+        Console.WriteLine($"Playlists: {entries.Count} difficulties, {entries.Count - missing.Count} already looked up, {missing.Count} to look up");
+
+        int n = 0;
+        foreach (var e in missing) {
+            PlaylistLeaderboard? found = null;
+            try {
+                string body = await GetWithRetry($"{apiUrl}/leaderboards?leaderboardContext=nomods&type=all&search={HttpUtility.UrlEncode(e.Hash)}" +
+                    $"&mode={HttpUtility.UrlEncode(e.Characteristic)}&difficulty={HttpUtility.UrlEncode(e.Name)}&page=1&count=1&sortBy=playcount&order=desc&allTypes=0" +
+                    (excludeRequirements > 0 ? $"&mapRequirements={excludeRequirements}&allRequirements=2" : "&allRequirements=0"));
+                var page = JsonSerializer.Deserialize<ResponseWithMetadata<LeaderboardInfoResponse>>(body, jsonOptions);
+                var lb = page?.Data?.FirstOrDefault();
+                if (lb != null) {
+                    found = new PlaylistLeaderboard(lb.Id, lb.Plays, lb.Difficulty?.Notes ?? 0, lb.Difficulty?.Njs ?? 0,
+                        Label(lb.Id, lb.Song?.Name, lb.Song?.Author, lb.Difficulty?.DifficultyName));
+                }
+            } catch (Exception ex) {
+                Console.WriteLine($"Lookup of {e.Hash} {e.Characteristic} {e.Name} failed: {ex.Message}");
+                continue;   // not cached: tried again next run
+            }
+            cache[e] = found;
+            string row = found == null
+                ? $"{e.Hash}\t{e.Characteristic}\t{e.Name}\t-"
+                : FormattableString.Invariant($"{e.Hash}\t{e.Characteristic}\t{e.Name}\t{found.Id}\t{found.Plays}\t{found.Notes}\t{found.Njs}\t{found.Label.Replace('\t', ' ')}");
+            File.AppendAllLines(cacheFile, new[] { row });
+            if (++n % 100 == 0) Console.WriteLine($"  looked up {n}/{missing.Count}");
+        }
+
+        var result = cache.Values.Where(v => v != null).Select(v => v!).GroupBy(v => v.Id).Select(g => g.First()).ToList();
+        Console.WriteLine($"Playlists: {result.Count} leaderboards found ({cache.Values.Count(v => v == null)} difficulties not on BeatLeader " +
+                          $"or excluded by --exclude-requirements)");
+        return result;
+    }
+
+    // A folder next to the project (like ReplaysPath), or an absolute path
+    static string RepoPath(string name) =>
+        Path.IsPathRooted(name) ? name : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", name));
 
     static async Task<bool> ProcessLeaderboard(string id, float njs, string label, string replaysRoot, RunOptions opt, int maxDownloads = int.MaxValue) {
         // Both score lists are needed, fetch them together.
@@ -534,9 +669,13 @@ public class Program
     // Usage:
     //   BLReplaysPrepare all                                  tight top groups -> replays\
     //   BLReplaysPrepare all --top 50 --out replays_wide      top 50 scores of every map, any spread
+    //   BLReplaysPrepare all --playlists [folder] ...         only the leaderboards of the playlists in folder (default playlists\)
+    //                                                         e.g. all --playlists --top 50 --out replays_wide
     //   BLReplaysPrepare test <leaderboardId>
     //   BLReplaysPrepare ratetest [leaderboardId]             measure the API rate limit
+    //   BLReplaysPrepare parity <ids file> [--top 10]          parity ground truth (hand-frame swing angle per cut) -> parity\
     //   BLReplaysPrepare all --min-scores 8 --recheck-skipped   check again only the leaderboards that weren't saved
+    // excluded.txt in the output folder: leaderboard ids never downloaded (one per line, '#' comments)
     // Options: --parallel-leaderboards 4  --parallel-replays 16  --api-delay-ms 250  --min-plays 200  --min-scores 10
     //          --min-notes 20   (leaderboards with fewer notes are skipped)
     //          --exclude-requirements 396   (Noodle + Mapping Extensions + VNJS + Vivify; 0 to keep them)
@@ -553,6 +692,13 @@ public class Program
         if (ArgValue(args, "--exclude-requirements") is string er) opt.ExcludeRequirements = int.Parse(er);
         if (ArgValue(args, "--min-scores") is string ms) opt.MinScores = int.Parse(ms);
         opt.RecheckSkipped = args.Contains("--recheck-skipped");
+        int pi = Array.IndexOf(args, "--playlists");
+        if (pi >= 0) {
+            // the folder is optional: "--playlists" alone uses playlists\ next to the project
+            string folder = pi + 1 < args.Length && !args[pi + 1].StartsWith("--") && args[pi + 1] != "all" ? args[pi + 1] : "playlists";
+            opt.PlaylistsFolder = RepoPath(folder);
+            Console.WriteLine($"Playlists folder: {opt.PlaylistsFolder}");
+        }
         replaySlots = new SemaphoreSlim(opt.ParallelReplays, opt.ParallelReplays);
         apiInterval = TimeSpan.FromMilliseconds(opt.ApiDelayMs);
 
@@ -562,6 +708,14 @@ public class Program
         }
         if (ArgValue(args, "test") is string testId) {
             await TestLeaderboard(testId, opt);
+            return;
+        }
+        if (ArgValue(args, "parity") is string parityList) {
+            await ExtractParity(parityList, opt.Top > 0 ? opt.Top : 10);
+            return;
+        }
+        if (ArgValue(args, "heads") is string headList) {
+            await ExtractHeads(headList, opt.Top > 0 ? opt.Top : 10);
             return;
         }
         if (args.Contains("all")) {

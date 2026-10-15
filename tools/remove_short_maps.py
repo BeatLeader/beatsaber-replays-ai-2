@@ -1,9 +1,9 @@
 """
 Find leaderboards in replays/ with fewer than 20 notes (BeatLeader's note count) and move them out of the training data.
 
-    python remove_short_maps.py               # list them only
-    python remove_short_maps.py --move        # move them to replays_excluded/
-    python remove_short_maps.py --min-notes 30 --replays replays_validation
+    python tools/remove_short_maps.py               # list them only
+    python tools/remove_short_maps.py --move        # move them to replays_excluded/
+    python tools/remove_short_maps.py --min-notes 30 --replays replays_validation
 
 Reads the note count of every leaderboard from BeatLeader's leaderboard list (1000 per request, most played first,
 down to --min-plays); folders not found that way are looked up one by one. Nothing is deleted.
@@ -62,7 +62,7 @@ def notes_of(leaderboard_id: str) -> int | None:
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (this script is in tools/)
     p = argparse.ArgumentParser()
     p.add_argument("--replays", default=os.path.join(here, "replays"))
     p.add_argument("--min-notes", type=int, default=20, help="leaderboards with fewer notes are removed")
